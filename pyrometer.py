@@ -92,7 +92,6 @@ class PyroStage:
         target = [x, y, z]
         for i, t in enumerate(target):
             if t is not None:
-                # Poprawiony warunek logiczny (lub zamiast i)
                 if t < 0 or t > 4:
                     raise ValueError(
                         "Invalid position. Please provide a value between 0 and 4."
@@ -310,7 +309,7 @@ class Results:
         self.positions = []
         self.timestamps = []
         self.measurement_ids = []
-        self.raw_data = []  # Przechowuje surowe próbki ze wskazaniem na ID pomiaru
+        self.raw_data = []
         self.start_time = time.time()
         self._current_id = 1
 
@@ -329,7 +328,6 @@ class Results:
         self.positions.append(positions)
         self.timestamps.append(timestamp)
 
-        # Rejestracja surowych próbek
         for sample_idx, raw_val in enumerate(raw_samples, start=1):
             self.raw_data.append(
                 {
@@ -360,22 +358,87 @@ class Results:
         return self.raw_data
 
 
+def measure_single_point(
+    device: PyroStage,
+    server: PyroServer,
+    x: float,
+    y: float,
+    z: float,
+    duration_sec: float,
+    frequency_hz: float,
+    output_filename: str = "Single_point_measurement.csv",
+):
+    """
+    Wykonuje pomiar ciągły w jednym zadanym punkcie (x, y, z)
+    przez zadaną liczbę sekund z określoną częstotliwością próbkowania.
+    Zapisuje surowe dane czasowe do pliku CSV bez przetworzenia.
+    """
+    print(
+        f"Moving stage to target position: ({x}, {y}, {z}) for single point measurement..."
+    )
+    device.move_to(x, y, z)
+    time.sleep(1)  # Odczekanie na stabilizację ruchu
+
+    interval = 1.0 / frequency_hz
+    total_samples = int(duration_sec * frequency_hz)
+
+    print(
+        f"Starting single point acquisition: {total_samples} samples over {duration_sec}s at {frequency_hz} Hz..."
+    )
+
+    start_time = time.time()
+    records = []
+
+    for idx in range(1, total_samples + 1):
+        sample_time = time.time() - start_time
+        temp_str = server.getTemp()
+        raw_temp = float(temp_str.split(" ")[4])
+
+        records.append(
+            {
+                "sample_index": idx,
+                "timestamp": sample_time,
+                "position": (x, y, z),
+                "raw_value": raw_temp,
+            }
+        )
+        time.sleep(interval)
+
+    print(f"Acquisition finished. Saving to {output_filename}...")
+    with open(output_filename, "w") as file:
+        file.write(
+            "Sample_Index;Timestamp;Position X;Position Y;Position Z;Raw_Temperature\n"
+        )
+        for rec in records:
+            file.write(
+                f"{rec['sample_index']};{rec['timestamp']:.4f};{rec['position'][0]};{rec['position'][1]};{rec['position'][2]};{rec['raw_value']}\n"
+            )
+
+    print("Single point measurement saved successfully.")
+
+
 def main() -> int:
     device = PyroStage("Kinesis Stage")
     server = PyroServer(address="192.168.1.112", port=9125, timeout=10)
+
+    # WYBÓR TRYBU PRACY: "single" -> pomiar stacjonarny, "grid" -> skanowanie 3D
+    MODE = "single"
+
+    # PARAMETRY DLA POMIARU STACJONARNEGO (MODE = "single")
+    single_x, single_y, single_z = 2.5, 2.5, 1.5
+    single_duration_sec = 10.0  # czas trwania w sekundach
+    single_frequency_hz = 10.0  # częstotliwość próbkowania w Hz
+
+    # PARAMETRY DLA SKANOWANIA SIATKI 3D (MODE = "grid")
     step = 0.5
-    xMin = 2
-    xMax = 3
-    yMin = 2
-    yMax = 3
-    zMin = 1
-    zMax = 2
+    xMin, xMax = 2, 3
+    yMin, yMax = 2, 3
+    zMin, zMax = 1, 2
 
     try:
         device.connect()
         if device.stage is None:
             raise DeviceNotConnected()
-        stage = device.stage
         server.connect()
         server._clearSocket()
 
@@ -389,39 +452,78 @@ def main() -> int:
 
     device.home()
 
-    results = Results()
-    for z in range(int((zMax - zMin) / step) + 1):
-        for y in range(int((yMax - yMin) / step) + 1):
-            for x in range(int((xMax - xMin) / step) + 1):
-                target_x = xMin + x * step
-                target_y = yMin + y * step
-                target_z = zMin + z * step
-                try:
-                    device.move_to(target_x, target_y, target_z)
-                    time.sleep(1)  # Odczekanie 1 sekundy po zakończeniu ruchu
+    if MODE == "single":
+        try:
+            measure_single_point(
+                device=device,
+                server=server,
+                x=single_x,
+                y=single_y,
+                z=single_z,
+                duration_sec=single_duration_sec,
+                frequency_hz=single_frequency_hz,
+                output_filename="Single_point_measurement.csv",
+            )
+        except Exception as e:
+            print(f"Error occurred during single point measurement: {e}")
+            return 2
 
-                    tempMeasurements = []
-                    # Pobieranie 21 próbek w ciągu ~1 sekundy
-                    for _ in range(21):
-                        tempStr = server.getTemp()
-                        temp_meas = float(tempStr.split(" ")[4])
-                        tempMeasurements.append(temp_meas)
-                        time.sleep(1.0 / 21)
+    elif MODE == "grid":
+        results = Results()
+        for z in range(int((zMax - zMin) / step) + 1):
+            for y in range(int((yMax - yMin) / step) + 1):
+                for x in range(int((xMax - xMin) / step) + 1):
+                    target_x = xMin + x * step
+                    target_y = yMin + y * step
+                    target_z = zMin + z * step
+                    try:
+                        device.move_to(target_x, target_y, target_z)
+                        time.sleep(1)
 
-                    # Posortuj i odrzuć 3 najmniejsze oraz 3 największe
-                    tempMeasurements_sorted = sorted(tempMeasurements)
-                    filtered = tempMeasurements_sorted[3:-3]
+                        tempMeasurements = []
+                        for _ in range(21):
+                            tempStr = server.getTemp()
+                            temp_meas = float(tempStr.split(" ")[4])
+                            tempMeasurements.append(temp_meas)
+                            time.sleep(1.0 / 21)
 
-                    temp = sum(filtered) / len(filtered)
-                    results.add_result(
-                        temp, (target_x, target_y, target_z), tempMeasurements
-                    )
-                    print(
-                        f"Position: ({target_x}, {target_y}, {target_z}), Filtered Avg Temp: {temp:.2f}"
-                    )
-                except Exception as e:
-                    print(f"Error occurred while moving or reading temperature: {e}")
-                    return 2
+                        tempMeasurements_sorted = sorted(tempMeasurements)
+                        filtered = tempMeasurements_sorted[3:-3]
+
+                        temp = sum(filtered) / len(filtered)
+                        results.add_result(
+                            temp,
+                            (target_x, target_y, target_z),
+                            tempMeasurements,
+                        )
+                        print(
+                            f"Position: ({target_x}, {target_y}, {target_z}), Filtered Avg Temp: {temp:.2f}"
+                        )
+                    except Exception as e:
+                        print(
+                            f"Error occurred while moving or reading temperature: {e}"
+                        )
+                        return 2
+
+        print("Saving processed results...")
+        with open("Test_measurement_processed.csv", "w") as file:
+            file.write(
+                "Measurement_ID;Timestamp;Position X;Position Y;Position Z;Temperature\n"
+            )
+            for result in results.get_results():
+                file.write(
+                    f"{result['measurement_id']};{result['timestamp']};{result['position'][0]};{result['position'][1]};{result['position'][2]};{result['value']}\n"
+                )
+
+        print("Saving raw samples...")
+        with open("Test_measurement_raw.csv", "w") as file:
+            file.write(
+                "Measurement_ID;Sample_Index;Timestamp;Position X;Position Y;Position Z;Raw_Temperature\n"
+            )
+            for raw in results.get_raw_results():
+                file.write(
+                    f"{raw['measurement_id']};{raw['sample_index']};{raw['timestamp']};{raw['position'][0]};{raw['position'][1]};{raw['position'][2]};{raw['raw_value']}\n"
+                )
 
     try:
         server.disconnect()
@@ -429,28 +531,7 @@ def main() -> int:
         print("Error during disconnect:", e)
         return 3
 
-    # Zapis wyników do osobnych plików CSV
-    print("Saving processed results...")
-    with open("Test_measurement_processed.csv", "w") as file:
-        file.write(
-            "Measurement_ID;Timestamp;Position X;Position Y;Position Z;Temperature\n"
-        )
-        for result in results.get_results():
-            file.write(
-                f"{result['measurement_id']};{result['timestamp']};{result['position'][0]};{result['position'][1]};{result['position'][2]};{result['value']}\n"
-            )
-
-    print("Saving raw samples...")
-    with open("Test_measurement_raw.csv", "w") as file:
-        file.write(
-            "Measurement_ID;Sample_Index;Timestamp;Position X;Position Y;Position Z;Raw_Temperature\n"
-        )
-        for raw in results.get_raw_results():
-            file.write(
-                f"{raw['measurement_id']};{raw['sample_index']};{raw['timestamp']};{raw['position'][0]};{raw['position'][1]};{raw['position'][2]};{raw['raw_value']}\n"
-            )
-
-    print("Measurement completed successfully.")
+    print("Execution completed successfully.")
     return 0
 
 
