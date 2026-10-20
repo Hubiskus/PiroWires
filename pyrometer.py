@@ -1,13 +1,15 @@
-import socket
 import threading
 import time
-from enum import Enum
-from typing import List, Tuple
+import tkinter as tk
+from tkinter import messagebox, ttk
 
 import pylablib as pll
 from pylablib.devices import Thorlabs
 
 
+# ==============================================================================
+# KLASY WYJĄTKÓW I OBSŁUGI SPRZĘTU
+# ==============================================================================
 class ThorlabsError(Exception):
     pass
 
@@ -20,519 +22,368 @@ class DeviceNotFound(ThorlabsError):
     pass
 
 
-class ConnectionError(ThorlabsError):
-    pass
-
-
-class PyroStage:
-    def __init__(self, device_name: str):
-        self.stage: Thorlabs.KinesisMotor | None = None
+class ThorlabsStage:
+    def __init__(
+        self,
+        device_name: str,
+        port_id: str,
+        steps_per_mm: float,
+        num_channels: int,
+        limits: list[tuple[float, float]],
+    ):
+        """
+        :param device_name: Nazwa stolika (np. 'Stolik Zgrubny XY')
+        :param port_id: Numer seryjny/PORT (np. '70817296')
+        :param steps_per_mm: Przelicznik kroków na mm
+        :param num_channels: Liczba osi/kanałów (2 lub 3)
+        :param limits: Lista krotek z limitami osi [(min_x, max_x), (min_y, max_y), ...]
+        """
         self.device_name = device_name
-        self._steps_per_mm = 51200  # MAGIC NUMBER BEING LITERAL STEPS PER MM FOR THE STAGE BSC103 WITH STEPPERS.
+        self.port_id = str(port_id)
+        self.steps_per_mm = steps_per_mm
+        self.num_channels = num_channels
+        self.limits = limits
+        self.stage: Thorlabs.KinesisMotor | None = None
 
     def connect(self):
         thor_devices = Thorlabs.list_kinesis_devices()
-        print("Found devices", thor_devices)
-        if thor_devices:
-            sel_dev = thor_devices[0][0]
-        else:
-            raise DeviceNotFound("FLAG_1")
-        self.stage = Thorlabs.KinesisMotor(
-            sel_dev,
-            is_rack_system=True,
-            scale=self._steps_per_mm,  # steps/mm, only if verified for this axis
-        )
-        if self.stage is None:
-            raise DeviceNotConnected()
-        if self.stage._connection_parameters["port"] != "70821739":
-            print("Connected to an unintended device.")
-            raise ThorlabsError(
-                "Not intended device connected. Please connect the correct device."
+        print(f"[{self.device_name}] Znalezione urządzenia:", thor_devices)
+
+        found = any(dev[0] == self.port_id for dev in thor_devices)
+        if not found:
+            raise DeviceNotFound(
+                f"Nie znaleziono urządzenia {self.device_name} (ID: {self.port_id})."
             )
 
-        self.stage.set_supported_channels(3)
+        self.stage = Thorlabs.KinesisMotor(
+            self.port_id, is_rack_system=True, scale=self.steps_per_mm
+        )
+
+        if self.stage is None:
+            raise DeviceNotConnected(
+                f"Błąd połączenia ze stolikiem {self.device_name}."
+            )
+
+        self.stage.set_supported_channels(self.num_channels)
+        print(f"[{self.device_name}] Połączono pomyślnie (PORT ID: {self.port_id}).")
 
     def _mm_to_steps(self, mm: float) -> int:
-        return int(mm * self._steps_per_mm)
+        return int(mm * self.steps_per_mm)
 
     def _steps_to_mm(self, steps: int) -> float:
-        return steps / self._steps_per_mm
+        return steps / self.steps_per_mm
 
-    def home(self):
+    def home(self, channel: int | None = None):
         if self.stage is None:
-            raise DeviceNotConnected("Can't proceed with homing, stage not connected.")
-        for i in range(3):
-            channel = i + 1
-            if self.stage.is_homed(channel):
-                print(f"Axis {channel} is homed.")
+            raise DeviceNotConnected(f"Stolik {self.device_name} niepodłączony.")
+
+        channels = (
+            [channel] if channel is not None else list(range(1, self.num_channels + 1))
+        )
+        for ch in channels:
+            if self.stage.is_homed(ch):
+                print(f"[{self.device_name}] Os {ch} jest już zabazowana.")
                 continue
-            else:
-                self.stage.home(channel=channel, sync=False, force=True)
-                print(
-                    f"Axis {channel} homing started; status:",
-                    self.stage.get_status(channel=channel),
-                )
-                try:
-                    self.stage.wait_for_home(channel=channel, timeout=10)
-                except Thorlabs.ThorlabsTimeoutError as e:
-                    raise RuntimeError(f"Homing timeout for axis {channel}.") from e
-                print(
-                    f"Axis {channel} homing complete:",
-                    self.stage.is_homed(channel=channel),
-                )
 
-    def move_to(
-        self,
-        x: float | None = None,
-        y: float | None = None,
-        z: float | None = None,
-    ):
+            self.stage.home(channel=ch, sync=False, force=True)
+            print(f"[{self.device_name}] Rozpoczęto bazowanie osi {ch}...")
+            try:
+                self.stage.wait_for_home(channel=ch, timeout=30)
+            except Thorlabs.ThorlabsTimeoutError as e:
+                raise RuntimeError(
+                    f"Przekroczono czas bazowania dla {self.device_name}, oś {ch}."
+                ) from e
+            print(
+                f"[{self.device_name}] Os {ch} zabazowana:",
+                self.stage.is_homed(ch),
+            )
+
+    def move_to(self, targets: list[float | None]):
+        """
+        targets: lista wartości pozycji dla osi [X, Y] lub [X, Y, Z].
+        Wartość None oznacza brak ruchu dla danej osi.
+        """
         if self.stage is None:
-            raise DeviceNotConnected()
-        target = [x, y, z]
-        for i, t in enumerate(target):
-            if t is not None:
-                if t < 0 or t > 4:
+            raise DeviceNotConnected(f"Stolik {self.device_name} niepodłączony.")
+
+        for i, target in enumerate(targets):
+            if target is not None:
+                ch = i + 1
+                min_lim, max_lim = self.limits[i]
+                if not (min_lim <= target <= max_lim):
                     raise ValueError(
-                        "Invalid position. Please provide a value between 0 and 4."
+                        f"[{self.device_name}] Pozycja Osi {ch} ({target} mm) poza zakresem [{min_lim}, {max_lim}] mm."
                     )
-                self.stage.move_to(self._mm_to_steps(t), i + 1, scale=False)
-                self.stage.wait_move(i + 1, timeout=10)
+                self.stage.move_to(self._mm_to_steps(target), channel=ch, scale=False)
+                self.stage.wait_move(channel=ch, timeout=30)
 
-    def move_relative(
-        self,
-        dx: float | None = None,
-        dy: float | None = None,
-        dz: float | None = None,
-    ):
+    def move_relative(self, deltas: list[float | None]):
         if self.stage is None:
-            raise DeviceNotConnected()
-        target = [dx, dy, dz]
-        for i, t in enumerate(target):
-            if t is not None:
-                current_pos = self.stage.get_position(i + 1, scale=False)
-                new_pos = current_pos + self._mm_to_steps(t)
-                target[i] = self._steps_to_mm(new_pos)
-        self.move_to(*target)
+            raise DeviceNotConnected(f"Stolik {self.device_name} niepodłączony.")
 
-    def get_position(self) -> tuple[float, float, float]:
+        current_positions = self.get_position()
+        targets = []
+        for i, delta in enumerate(deltas):
+            if delta is not None:
+                targets.append(current_positions[i] + delta)
+            else:
+                targets.append(None)
+
+        self.move_to(targets)
+
+    def get_position(self) -> list[float]:
         if self.stage is None:
-            raise DeviceNotConnected()
+            raise DeviceNotConnected(f"Stolik {self.device_name} niepodłączony.")
+
         positions = []
-        for i in range(3):
-            positions.append(
-                self._steps_to_mm(self.stage.get_position(i + 1, scale=False))
-            )
-        return tuple(positions)
+        for ch in range(1, self.num_channels + 1):
+            steps = self.stage.get_position(channel=ch, scale=False)
+            positions.append(round(self._steps_to_mm(steps), 4))
+        return positions
 
 
-class PyroCommands(Enum):
-    GETTEMP = "GetTemp"
-    GETINT = "GetInt"
+# ==============================================================================
+# INTERFEJS GRAFICZNY (TKINTER GUI)
+# ==============================================================================
+class StageControlPanel(ttk.LabelFrame):
+    """Panel kontrolny dla pojedynczego stolika (XY lub XYZ)"""
 
+    def __init__(self, parent, stage: ThorlabsStage, log_callback):
+        super().__init__(parent, text=f" {stage.device_name} ", padding=10)
+        self.stage = stage
+        self.log = log_callback
+        self.axis_names = ["X", "Y", "Z"][: stage.num_channels]
 
-class PyroServer:
-    def __init__(
-        self,
-        address="192.168.1.112",
-        port=9125,
-        timeout=10.0,
-    ):
-        self.address = address
-        self.port = port
-        self.protocol = "Text based TCP/IP"
-        self.endMessageSymbol = "\r\n"
+        self.entries_abs = {}
+        self.entries_rel = {}
+        self.pos_labels = {}
 
-        self.timeout = timeout
-        self.isConnected = False
-        self.lastFrame = time.monotonic()
+        self._create_widgets()
 
-        self._socket = None
-        self._lock = threading.Lock()
+    def _create_widgets(self):
+        # 1. Sekcja aktualnej pozycji
+        pos_frame = ttk.Frame(self)
+        pos_frame.pack(fill="x", pady=5)
 
-    def connect(self):
-        """Establish a TCP connection."""
-        print(f"Establishing connection: \nAddress:{self.address}\nPort:{self.port}")
-        with self._lock:
-            if self.isConnected:
-                return
+        ttk.Label(
+            pos_frame, text="Aktualna pozycja: ", font=("Helvetica", 9, "bold")
+        ).pack(side="left")
+        for i, name in enumerate(self.axis_names):
+            lbl = ttk.Label(pos_frame, text=f"{name}: --- mm ", font=("Consolas", 10))
+            lbl.pack(side="left", padx=5)
+            self.pos_labels[i] = lbl
 
-            sock = socket.create_connection(
-                (self.address, self.port),
-                timeout=self.timeout,
-            )
-            print("Socket created.")
-            sock.settimeout(self.timeout)
-
-            self._socket = sock
-            self.isConnected = True
-            self.lastFrame = time.monotonic()
-
-    def disconnect(self):
-        """Close the TCP connection safely."""
-        with self._lock:
-            self._disconnect_unlocked()
-
-    def _disconnect_unlocked(self):
-        sock = self._socket
-        self._socket = None
-        self.isConnected = False
-
-        if sock is not None:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            finally:
-                sock.close()
-
-    def read_response(self, timeout=-1.0):
-        """Read one CRLF-terminated response from the server."""
-        return self._read_socket(timeout)
-
-    def send_command(self, command, timeout=-1.0):
-        """Send one command and return one CRLF-terminated response."""
-        return self._send_command(command, timeout)
-
-    def _read_socket(self, timeout=-1.0):
-        """Return one CRLF-terminated string."""
-        with self._lock:
-            if not self.isConnected or self._socket is None:
-                raise ConnectionError("Not connected to PyroServer")
-            timestamp = time.monotonic()
-            try:
-                response = bytearray()
-                while not response.endswith(b"\r\n"):
-                    try:
-                        chunk = self._socket.recv(1024)
-                    except socket.error as e:
-                        if e.errno == socket.EWOULDBLOCK:
-                            chunk = b""
-                        else:
-                            raise
-                    if len(chunk) > 0:
-                        timestamp = time.monotonic()
-                    if chunk is None:
-                        raise ConnectionError("Server closed the connection")
-
-                    response.extend(chunk)
-
-                    if len(response) > 65536:
-                        raise ValueError("Response exceeds maximum size")
-                    if timeout < 0:
-                        continue
-                    if time.monotonic() - timestamp > timeout:
-                        return None
-
-                self.lastFrame = time.monotonic()
-                return response[:-2].decode("ascii")
-
-            except (OSError, UnicodeDecodeError, ValueError):
-                self._disconnect_unlocked()
-                raise
-
-    def _send_command(self, command, timeout=-1.0):
-        """Send one command and return one CRLF-terminated response."""
-        with self._lock:
-            if not self.isConnected or self._socket is None:
-                raise ConnectionError("Not connected to PyroServer")
-
-            try:
-                message = command + self.endMessageSymbol
-                self._socket.sendall(message.encode("ascii"))
-                start_timestamp = time.monotonic()
-                response = bytearray()
-
-                while not response.endswith(b"\r\n"):
-                    chunk = self._socket.recv(1024)
-
-                    if not chunk:
-                        raise ConnectionError("Server closed the connection")
-                    if len(chunk) > 0:
-                        start_timestamp = time.monotonic()
-
-                    response.extend(chunk)
-
-                    if len(response) > 65536:
-                        raise ValueError("Response exceeds maximum size")
-                    if timeout < 0:
-                        continue
-                    if time.monotonic() - start_timestamp > timeout:
-                        return (
-                            response[:-2].decode("ascii") + "ERROR: TIMEOUTED RESPONSE"
-                        )
-
-                self.lastFrame = time.monotonic()
-                return response[:-2].decode("ascii")
-
-            except (OSError, UnicodeDecodeError, ValueError):
-                self._disconnect_unlocked()
-                raise
-
-    def getTemp(self):
-        """Request temperature from the device."""
-        return self._send_command(PyroCommands.GETTEMP.value)
-
-    def getInt(self):
-        """Request an integer value from the device."""
-        return self._send_command(PyroCommands.GETINT.value)
-
-    def _watchdog(self, max_idle_seconds=30):
-        """Disconnect if no successful communication occurred recently."""
-        if time.monotonic() - self.lastFrame > max_idle_seconds:
-            self.disconnect()
-
-    def _clearSocket(self):
-        print("Clearing socket buffer...")
-        if self._socket is None:
-            raise ConnectionError("No socket created for clearing!")
-        self._socket.setblocking(False)
-        msg = self.read_response(0.1)
-        while msg is not None:
-            if msg is not None:
-                print("Cleared message:", msg)
-            msg = self.read_response(0.1)
-        self._socket.setblocking(True)
-        print("Clearing done.")
-
-    def __enter__(self):
-        self.connect()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.disconnect()
-
-
-class Results:
-    def __init__(self):
-        self.data = []
-        self.positions = []
-        self.timestamps = []
-        self.measurement_ids = []
-        self.raw_data = []
-        self.start_time = time.time()
-        self._current_id = 1
-
-    def add_result(
-        self,
-        value: float,
-        positions: Tuple[float, float, float],
-        raw_samples: List[float],
-    ):
-        meas_id = self._current_id
-        self._current_id += 1
-        timestamp = time.time() - self.start_time
-
-        self.measurement_ids.append(meas_id)
-        self.data.append(value)
-        self.positions.append(positions)
-        self.timestamps.append(timestamp)
-
-        for sample_idx, raw_val in enumerate(raw_samples, start=1):
-            self.raw_data.append(
-                {
-                    "measurement_id": meas_id,
-                    "sample_index": sample_idx,
-                    "timestamp": timestamp,
-                    "position": positions,
-                    "raw_value": raw_val,
-                }
-            )
-
-    def get_results(self):
-        results = []
-        for m_id, timestamp, value, position in zip(
-            self.measurement_ids, self.timestamps, self.data, self.positions
-        ):
-            results.append(
-                {
-                    "measurement_id": m_id,
-                    "timestamp": timestamp,
-                    "value": value,
-                    "position": position,
-                }
-            )
-        return results
-
-    def get_raw_results(self):
-        return self.raw_data
-
-
-def measure_single_point(
-    device: PyroStage,
-    server: PyroServer,
-    x: float,
-    y: float,
-    z: float,
-    duration_sec: float,
-    frequency_hz: float,
-    output_filename: str = "Single_point_measurement.csv",
-):
-    """
-    Wykonuje pomiar ciągły w jednym zadanym punkcie (x, y, z)
-    przez zadaną liczbę sekund z określoną częstotliwością próbkowania.
-    Zapisuje surowe dane czasowe do pliku CSV bez przetworzenia.
-    """
-    print(
-        f"Moving stage to target position: ({x}, {y}, {z}) for single point measurement..."
-    )
-    device.move_to(x, y, z)
-    time.sleep(1)  # Odczekanie na stabilizację ruchu
-
-    interval = 1.0 / frequency_hz
-    total_samples = int(duration_sec * frequency_hz)
-
-    print(
-        f"Starting single point acquisition: {total_samples} samples over {duration_sec}s at {frequency_hz} Hz..."
-    )
-
-    start_time = time.time()
-    records = []
-
-    for idx in range(1, total_samples + 1):
-        sample_time = time.time() - start_time
-        temp_str = server.getTemp()
-        raw_temp = float(temp_str.split(" ")[4])
-
-        records.append(
-            {
-                "sample_index": idx,
-                "timestamp": sample_time,
-                "position": (x, y, z),
-                "raw_value": raw_temp,
-            }
+        # 2. Przycisk Homing
+        btn_home = ttk.Button(
+            self, text="Bazuj wszystkie osie (Home)", command=self._on_home
         )
-        time.sleep(interval)
+        btn_home.pack(fill="x", pady=5)
 
-    print(f"Acquisition finished. Saving to {output_filename}...")
-    with open(output_filename, "w") as file:
-        file.write(
-            "Sample_Index;Timestamp;Position X;Position Y;Position Z;Raw_Temperature\n"
+        # 3. Sekcja Ruchu Bezwzględnego (Move Absolute)
+        abs_frame = ttk.LabelFrame(self, text=" Ruch bezwzględny (mm) ")
+        abs_frame.pack(fill="x", pady=5)
+
+        for i, name in enumerate(self.axis_names):
+            min_lim, max_lim = self.stage.limits[i]
+            row_f = ttk.Frame(abs_frame)
+            row_f.pack(fill="x", padx=5, pady=2)
+
+            ttk.Label(
+                row_f, text=f"Os {name} [{min_lim}-{max_lim} mm]:", width=20
+            ).pack(side="left")
+            entry = ttk.Entry(row_f, width=10)
+            entry.pack(side="left", padx=5)
+            self.entries_abs[i] = entry
+
+        ttk.Button(abs_frame, text="Jedź do pozycji", command=self._on_move_abs).pack(
+            fill="x", padx=5, pady=5
         )
-        for rec in records:
-            file.write(
-                f"{rec['sample_index']};{rec['timestamp']:.4f};{rec['position'][0]};{rec['position'][1]};{rec['position'][2]};{rec['raw_value']}\n"
-            )
 
-    print("Single point measurement saved successfully.")
+        # 4. Sekcja Ruchu Względnego (Move Relative)
+        rel_frame = ttk.LabelFrame(self, text=" Ruch względny (Δ mm) ")
+        rel_frame.pack(fill="x", pady=5)
 
+        for i, name in enumerate(self.axis_names):
+            row_f = ttk.Frame(rel_frame)
+            row_f.pack(fill="x", padx=5, pady=2)
 
-def main() -> int:
-    device = PyroStage("Kinesis Stage")
-    server = PyroServer(address="192.168.1.112", port=9125, timeout=10)
+            ttk.Label(row_f, text=f"Delta {name}:", width=20).pack(side="left")
+            entry = ttk.Entry(row_f, width=10)
+            entry.pack(side="left", padx=5)
+            self.entries_rel[i] = entry
 
-    # WYBÓR TRYBU PRACY: "single" -> pomiar stacjonarny, "grid" -> skanowanie 3D
-    MODE = "single"
+        ttk.Button(rel_frame, text="Przesuń o wartość", command=self._on_move_rel).pack(
+            fill="x", padx=5, pady=5
+        )
 
-    # PARAMETRY DLA POMIARU STACJONARNEGO (MODE = "single")
-    single_x, single_y, single_z = 2.5, 2.5, 1.5
-    single_duration_sec = 10.0  # czas trwania w sekundach
-    single_frequency_hz = 10.0  # częstotliwość próbkowania w Hz
-
-    # PARAMETRY DLA SKANOWANIA SIATKI 3D (MODE = "grid")
-    step = 0.5
-    xMin, xMax = 2, 3
-    yMin, yMax = 2, 3
-    zMin, zMax = 1, 2
-
-    try:
-        device.connect()
-        if device.stage is None:
-            raise DeviceNotConnected()
-        server.connect()
-        server._clearSocket()
-
-    except (DeviceNotFound, DeviceNotConnected) as e:
-        print("No Thorlabs devices found or connected:", e)
-        return 1
-
-    except ConnectionError as e:
-        print("Failed to connect to server:", e)
-        return 1
-
-    device.home()
-
-    if MODE == "single":
+    def update_position_display(self):
         try:
-            measure_single_point(
-                device=device,
-                server=server,
-                x=single_x,
-                y=single_y,
-                z=single_z,
-                duration_sec=single_duration_sec,
-                frequency_hz=single_frequency_hz,
-                output_filename="Single_point_measurement.csv",
-            )
+            positions = self.stage.get_position()
+            for i, val in enumerate(positions):
+                self.pos_labels[i].config(text=f"{self.axis_names[i]}: {val:.4f} mm")
         except Exception as e:
-            print(f"Error occurred during single point measurement: {e}")
-            return 2
+            self.log(f"Błąd odczytu pozycji [{self.stage.device_name}]: {e}")
 
-    elif MODE == "grid":
-        results = Results()
-        for z in range(int((zMax - zMin) / step) + 1):
-            for y in range(int((yMax - yMin) / step) + 1):
-                for x in range(int((xMax - xMin) / step) + 1):
-                    target_x = xMin + x * step
-                    target_y = yMin + y * step
-                    target_z = zMin + z * step
-                    try:
-                        device.move_to(target_x, target_y, target_z)
-                        time.sleep(1)
+    def _run_in_thread(self, target_func, *args):
+        """Uruchamia operację ruchu w osobnym wątku"""
 
-                        tempMeasurements = []
-                        for _ in range(21):
-                            tempStr = server.getTemp()
-                            temp_meas = float(tempStr.split(" ")[4])
-                            tempMeasurements.append(temp_meas)
-                            time.sleep(1.0 / 21)
+        def worker():
+            try:
+                target_func(*args)
+                self.update_position_display()
+                self.log(f"[{self.stage.device_name}] Operacja zakończona pomyślnie.")
+            except Exception as e:
+                self.log(f"[{self.stage.device_name}] BŁĄD: {e}")
+                messagebox.showerror("Błąd ruchu", str(e))
 
-                        tempMeasurements_sorted = sorted(tempMeasurements)
-                        filtered = tempMeasurements_sorted[3:-3]
+        threading.Thread(target=worker, daemon=True).start()
 
-                        temp = sum(filtered) / len(filtered)
-                        results.add_result(
-                            temp,
-                            (target_x, target_y, target_z),
-                            tempMeasurements,
-                        )
-                        print(
-                            f"Position: ({target_x}, {target_y}, {target_z}), Filtered Avg Temp: {temp:.2f}"
-                        )
-                    except Exception as e:
-                        print(
-                            f"Error occurred while moving or reading temperature: {e}"
-                        )
-                        return 2
+    def _on_home(self):
+        self.log(f"[{self.stage.device_name}] Rozpoczynanie bazowania...")
+        self._run_in_thread(self.stage.home)
 
-        print("Saving processed results...")
-        with open("Test_measurement_processed.csv", "w") as file:
-            file.write(
-                "Measurement_ID;Timestamp;Position X;Position Y;Position Z;Temperature\n"
-            )
-            for result in results.get_results():
-                file.write(
-                    f"{result['measurement_id']};{result['timestamp']};{result['position'][0]};{result['position'][1]};{result['position'][2]};{result['value']}\n"
-                )
+    def _on_move_abs(self):
+        targets = []
+        for i in range(self.stage.num_channels):
+            val_str = self.entries_abs[i].get().strip()
+            if val_str:
+                try:
+                    targets.append(float(val_str))
+                except ValueError:
+                    messagebox.showerror(
+                        "Błąd wejścia",
+                        f"Nieprawidłowa wartość dla osi {self.axis_names[i]}",
+                    )
+                    return
+            else:
+                targets.append(None)
 
-        print("Saving raw samples...")
-        with open("Test_measurement_raw.csv", "w") as file:
-            file.write(
-                "Measurement_ID;Sample_Index;Timestamp;Position X;Position Y;Position Z;Raw_Temperature\n"
-            )
-            for raw in results.get_raw_results():
-                file.write(
-                    f"{raw['measurement_id']};{raw['sample_index']};{raw['timestamp']};{raw['position'][0]};{raw['position'][1]};{raw['position'][2]};{raw['raw_value']}\n"
-                )
+        if all(t is None for t in targets):
+            return
 
-    try:
-        server.disconnect()
-    except Exception as e:
-        print("Error during disconnect:", e)
-        return 3
+        self.log(f"[{self.stage.device_name}] Ruch bezwzględny do pozycji: {targets}")
+        self._run_in_thread(self.stage.move_to, targets)
 
-    print("Execution completed successfully.")
-    return 0
+    def _on_move_rel(self):
+        deltas = []
+        for i in range(self.stage.num_channels):
+            val_str = self.entries_rel[i].get().strip()
+            if val_str:
+                try:
+                    deltas.append(float(val_str))
+                except ValueError:
+                    messagebox.showerror(
+                        "Błąd wejścia",
+                        f"Nieprawidłowa wartość delty dla osi {self.axis_names[i]}",
+                    )
+                    return
+            else:
+                deltas.append(None)
+
+        if all(d is None for d in deltas):
+            return
+
+        self.log(f"[{self.stage.device_name}] Ruch względny o przesunięcia: {deltas}")
+        self._run_in_thread(self.stage.move_relative, deltas)
+
+
+class ThorlabsGUI(tk.Tk):
+    def __init__(self, coarse_stage: ThorlabsStage, fine_stage: ThorlabsStage):
+        super().__init__()
+        self.title("Thorlabs Dual Stage Controller")
+        self.geometry("750 x 650")
+
+        self.coarse_stage = coarse_stage
+        self.fine_stage = fine_stage
+
+        self._create_layout()
+        self._connect_devices()
+
+    def _create_layout(self):
+        # Główny kontener dwóch paneli
+        stages_frame = ttk.Frame(self, padding=10)
+        stages_frame.pack(fill="both", expand=True)
+
+        # Left: Stolik Zgrubny XY
+        self.panel_coarse = StageControlPanel(
+            stages_frame, self.coarse_stage, self.log_message
+        )
+        self.panel_coarse.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+
+        # Right: Stolik Precyzyjny XYZ
+        self.panel_fine = StageControlPanel(
+            stages_frame, self.fine_stage, self.log_message
+        )
+        self.panel_fine.pack(side="right", fill="both", expand=True, padx=5, pady=5)
+
+        # Dolny panel konsoli / logów
+        log_frame = ttk.LabelFrame(self, text=" Dziennik zdarzeń ", padding=5)
+        log_frame.pack(fill="x", padx=15, pady=10)
+
+        self.log_text = tk.Text(log_frame, height=8, state="disabled")
+        self.log_text.pack(fill="both", expand=True)
+
+    def log_message(self, message: str):
+        timestamp = time.strftime("%H:%M:%S")
+        formatted = f"[{timestamp}] {message}\n"
+
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", formatted)
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
+    def _connect_devices(self):
+        def connect_worker():
+            # Połączenie ze stolikiem Zgrubnym
+            try:
+                self.coarse_stage.connect()
+                self.panel_coarse.update_position_display()
+                self.log_message("Stolik Zgrubny XY gotowy.")
+            except Exception as e:
+                self.log_message(f"Błąd połączenia z Zgrubnym XY: {e}")
+
+            # Połączenie ze stolikiem Precyzyjnym
+            try:
+                self.fine_stage.connect()
+                self.panel_fine.update_position_display()
+                self.log_message("Stolik Precyzyjny XYZ gotowy.")
+            except Exception as e:
+                self.log_message(f"Błąd połączenia z Precyzyjnym XYZ: {e}")
+
+        threading.Thread(target=connect_worker, daemon=True).start()
+
+
+# ==============================================================================
+# MAIN PROGRAM
+# ==============================================================================
+def main():
+    # 1. Konfiguracja Stolika Zgrubnego XY
+    # - Port ID: 70817296
+    # - Os 1 (X): 0 do 50 mm, Os 2 (Y): 0 do 75 mm
+    # - Przelicznik: 2560 kroków/mm
+    coarse_stage = ThorlabsStage(
+        device_name="Stolik Zgrubny XY",
+        port_id="70817296",
+        steps_per_mm=2560,
+        num_channels=2,
+        limits=[(0.0, 50.0), (0.0, 75.0)],
+    )
+
+    # 2. Konfiguracja Stolika Precyzyjnego XYZ
+    # - Port ID: 70821739
+    # - Osie X, Y, Z: 0 do 4 mm każda
+    # - Przelicznik: 51200 kroków/mm
+    fine_stage = ThorlabsStage(
+        device_name="Stolik Precyzyjny XYZ",
+        port_id="70821739",
+        steps_per_mm=51200,
+        num_channels=3,
+        limits=[(0.0, 4.0), (0.0, 4.0), (0.0, 4.0)],
+    )
+
+    # 3. Uruchomienie aplikacji GUI
+    app = ThorlabsGUI(coarse_stage=coarse_stage, fine_stage=fine_stage)
+    app.mainloop()
 
 
 if __name__ == "__main__":
