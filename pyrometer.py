@@ -291,7 +291,7 @@ class ThorlabsGUI(tk.Tk):
     def __init__(self, coarse_stage: ThorlabsStage, fine_stage: ThorlabsStage):
         super().__init__()
         self.title("Thorlabs Dual Stage Controller")
-        self.geometry("750 x 650")
+        self.geometry("750x650")
 
         self.coarse_stage = coarse_stage
         self.fine_stage = fine_stage
