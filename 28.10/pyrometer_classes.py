@@ -36,13 +36,35 @@ class PyroServer:
         self.sock = None
         self.isConnected = False
 
+    def clear_buffer(self) -> None:
+        """Czyszczenie starych, zalegających danych z bufora odbiorczego socketu."""
+        if not self.sock or not self.isConnected:
+            return
+        try:
+            self.sock.setblocking(False)
+            while True:
+                data = self.sock.recv(4096)
+                if not data:
+                    break
+        except (BlockingIOError, socket.error):
+            pass
+        finally:
+            if self.sock:
+                self.sock.settimeout(self.timeout)
+
     def send_command(self, cmd: str) -> str:
         """Wysyła polecenie tekstowe do pirometru i zwraca odpowiedź."""
         if not self.isConnected or not self.sock:
             self.connect()
         try:
+            # 1. Wyczyść stare zaległości z bufora przed wysłaniem komendy
+            self.clear_buffer()
+
+            # 2. Wysyłanie właściwego polecenia
             full_cmd = (cmd.strip() + "\n").encode("utf-8")
             self.sock.sendall(full_cmd)
+
+            # 3. Odczyt właściwej odpowiedzi
             data = self.sock.recv(1024).decode("utf-8", errors="ignore").strip()
             if not data:
                 raise ConnectionError("Pusta odpowiedź z serwera pirometru")
@@ -72,3 +94,12 @@ class PyroServer:
             return "unknown"
         except Exception:
             return "unknown"
+
+    def setPyroType(self, mode: str) -> str:
+        """
+        Ustawia tryb pracy pirometru (SetPyroType 1 <0/1/2>).
+        mode: 'dual' -> 0, 'ch1' -> 1, 'ch2' -> 2
+        """
+        mode_map = {"dual": "0", "ch1": "1", "ch2": "2"}
+        code = mode_map.get(mode.lower().strip(), mode)
+        return self.send_command(f"SetPyroType 1 {code}")
