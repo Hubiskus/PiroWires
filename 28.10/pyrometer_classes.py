@@ -42,7 +42,6 @@ class PyroServer:
         self.isConnected = False
 
     def clear_buffer(self) -> None:
-        """Czyszczenie starych, zalegających danych z bufora odbiorczego socketu."""
         if not self.sock or not self.isConnected:
             return
         try:
@@ -58,7 +57,6 @@ class PyroServer:
                 self.sock.settimeout(self.timeout)
 
     def send_command(self, cmd: str) -> str:
-        """Wysyła polecenie tekstowe do pirometru i zwraca odpowiedź."""
         if not self.isConnected or not self.sock:
             self.connect()
         try:
@@ -77,10 +75,6 @@ class PyroServer:
         return self.send_command("GetTemp")
 
     def getPyroType(self) -> str:
-        """
-        Odpytuje pirometr o tryb pracy (GetPyroType 1).
-        Zwraca: 'dual' (0), 'ch1' (1), 'ch2' (2) lub 'unknown'.
-        """
         try:
             resp = self.send_command("GetPyroType 1")
             tokens = resp.strip().split()
@@ -93,10 +87,6 @@ class PyroServer:
             return "unknown"
         
     def getSignal(self) -> tuple[float, float]:
-        """
-        Wysyła polecenie 'getSignal' (bez parametru 1).
-        Bierze 2 ostatnie tokeny odpowiedzi i zwraca je jako float: (Det1, Det2).
-        """
         resp = self.send_command("GetSignal")
         tokens = resp.strip().split()
         if len(tokens) >= 2 and not tokens[0].upper().startswith("ERR"):
@@ -104,14 +94,10 @@ class PyroServer:
         raise ValueError(f"Nieprawidłowa odpowiedź z getSignal: {resp!r}")
 
     def getSignalLevel(self) -> tuple[float, float]:
-        """
-        Wysyła polecenie 'getSignalLevel' (bez parametru 1).
-        Bierze 2 ostatnie tokeny odpowiedzi i zwraca je jako float: (Det1, Det2).
-        """
         resp = self.send_command("GetSignalLevel")
         tokens = resp.strip().split()
-        print(resp)
-        print(tokens)
+        # print(resp)
+        # print(tokens)
         if len(tokens) >= 2 and not tokens[0].upper().startswith("ERR"):
             return float(tokens[-2]), float(tokens[-1])
         raise ValueError(f"Nieprawidłowa odpowiedź z getSignalLevel: {resp!r}")

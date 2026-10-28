@@ -2,11 +2,6 @@
 stage_control.py - logic layer for two Thorlabs BSC103 controllers (Kinesis C API via ctypes):
   - fine stage   (NanoMax-TS, controller 70821739): X, Y, Z
   - coarse stage (MAX201,     controller 70817296): X, Y (no Z)
-
-No UI code in here. All positions are in mm, relative to each axis's software zero.
-Every DLL call is serialised with a lock, so the Stages object can be used from several
-threads (e.g. a GUI thread plus one worker thread per moving axis).
-Close Kinesis completely before using this module.
 """
 import ctypes
 import os
@@ -21,7 +16,7 @@ KINESIS_DIR = r"c:\Thorlabs\Kinesis"
 CONTROLLERS = {"nano": b"70821739", "max": b"70817296"}
 CONTROLLER_LABELS = {"nano": "Fine stage (NanoMax-TS)", "max": "Coarse stage (MAX201)"}
 
-# axis -> (controller, channel). Channel mapping: verify with small moves if you change cabling.
+# axis -> (controller, channel). 
 AXES = {
     "nano_x": ("nano", 1),
     "nano_y": ("nano", 2),
@@ -30,7 +25,6 @@ AXES = {
     "max_y":  ("max", 2),
 }
 
-# Soft limits in mm, relative to each axis's software zero
 LIMITS_MM = {
     "nano_x": (0.0, 4.0),
     "nano_y": (0.0, 4.0),

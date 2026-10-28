@@ -225,6 +225,11 @@ class ScanParams:
     drop_low: int = 3
     drop_high: int = 3
     sample_delay_s: float = 0.05
+    # Lokalne dogęszczanie Z na każdym X
+    refine_local_z: bool = True
+    refine_local_z_halfwidth: float = 0.3
+    refine_local_z_step: float = 0.02
+    # Globalne dogęszczanie X i Z wokół ogniska
     refine: bool = True
     refine_x_halfwidth: float = 5.0
     refine_x_step: float = 1.0
@@ -340,15 +345,6 @@ def run_stepwise_scan(stages: sc.Stages, reader: PyroReader, p: ScanParams, stop
         if on_point:
             on_point(pt)
 
-    def sweep(xs: list[float], zs: list[float], phase: str) -> None:
-        total, done = len(xs) * len(zs), 0
-        for x in xs:
-            for z in zs:
-                measure(x, z, phase)
-                done += 1
-                if on_progress:
-                    on_progress(phase, done, total)
-
     try:
         if raw_path is not None:
             raw_stream = raw_path.open("w", newline="", encoding="utf-8")
@@ -358,32 +354,75 @@ def run_stepwise_scan(stages: sc.Stages, reader: PyroReader, p: ScanParams, stop
 
         xs = frange(p.x_start, p.x_stop, p.x_step)
         zs = frange(p.z_start, p.z_stop, p.z_step)
-        info(f"Skan zgrubny: {len(xs)} plaszczyzn X x {len(zs)} punktow Z")
-        sweep(xs, zs, "coarse")
+
+        est_local_z = len(frange(-p.refine_local_z_halfwidth, p.refine_local_z_halfwidth, p.refine_local_z_step)) if p.refine_local_z else 0
+        total_points_est = len(xs) * (len(zs) + est_local_z)
+        done_points = 0
+
+        info(f"Skanowanie: {len(xs)} kroków X")
+
+        for x in xs:
+            # 1. Zgrubny przejazd w Z dla aktualnego X
+            for z in zs:
+                measure(x, z, "coarse")
+                done_points += 1
+                if on_progress:
+                    on_progress("coarse", done_points, total_points_est)
+
+            # 2. Lokalne dogęszczanie wokół maksimum na tym konkretnym X
+            if p.refine_local_z:
+                pts_x = [pt for pt in points.values() if pt.x == round(x, 6)]
+                if pts_x:
+                    local_peak = max(pts_x, key=lambda q: q.mean)
+                    lo_z = max(p.z_start, local_peak.z - p.refine_local_z_halfwidth)
+                    hi_z = min(p.z_stop, local_peak.z + p.refine_local_z_halfwidth)
+                    done_z = {pt.z for pt in pts_x}
+                    new_zs = [z for z in frange(lo_z, hi_z, p.refine_local_z_step) if z not in done_z]
+
+                    if new_zs:
+                        info(f"Lokalne dogęszczanie Z na X = {x:g} mm wokół {local_peak.z:g} mm ({len(new_zs)} pkt)")
+                        for z in new_zs:
+                            measure(x, z, "refine_local_z")
+                            done_points += 1
+                            if on_progress:
+                                on_progress("refine_local_z", done_points, total_points_est)
 
         focus = best()
         if focus:
-            info(f"Wyznaczone ognisko (zgrubne): X = {focus.x:g} mm, Z = {focus.z:g} mm, Temp = {focus.mean:.2f} C")
+            info(f"Wyznaczone ognisko (zgrubne/lokalne): X = {focus.x:g} mm, Z = {focus.z:g} mm, Temp = {focus.mean:.2f} C")
 
+        # 3. Globalne dogęszczanie osi X i Z wokół ogniska po skanowaniu wszystkich płaszczyzn X
         if p.refine and focus:
             lo_x = max(p.x_start, focus.x - p.refine_x_halfwidth)
             hi_x = min(p.x_stop, focus.x + p.refine_x_halfwidth)
             done_x = {k[0] for k in points}
             new_xs = [x for x in frange(lo_x, hi_x, p.refine_x_step) if x not in done_x]
             if new_xs:
-                info(f"Zageszczanie X wokol {focus.x:g} mm ({len(new_xs)} nowych plaszczyzn)")
-                sweep(new_xs, zs, "refine_x")
-            focus = best()
+                info(f"Zagęszczanie globalne X wokół {focus.x:g} mm ({len(new_xs)} nowych płaszczyzn)")
+                for x in new_xs:
+                    for z in zs:
+                        measure(x, z, "refine_x")
+                        done_points += 1
+                        if on_progress:
+                            on_progress("refine_x", done_points, total_points_est)
+                focus = best()
 
-            lo_z = max(p.z_start, focus.z - p.refine_z_halfwidth)
-            hi_z = min(p.z_stop, focus.z + p.refine_z_halfwidth)
-            done_z = {k[1] for k in points if k[0] == round(focus.x, 6)}
-            new_zs = [z for z in frange(lo_z, hi_z, p.refine_z_step) if z not in done_z]
-            if new_zs:
-                info(f"Zageszczanie Z wokol {focus.z:g} mm na plaszczyznie X = {focus.x:g} mm ({len(new_zs)} nowych punktow)")
-                sweep([focus.x], new_zs, "refine_z")
-            focus = best()
-            info(f"Ognisko koncowe: X = {focus.x:g} mm, Z = {focus.z:g} mm, Temp = {focus.mean:.2f} C")
+            if focus:
+                lo_z = max(p.z_start, focus.z - p.refine_z_halfwidth)
+                hi_z = min(p.z_stop, focus.z + p.refine_z_halfwidth)
+                done_z = {k[1] for k in points if k[0] == round(focus.x, 6)}
+                new_zs = [z for z in frange(lo_z, hi_z, p.refine_z_step) if z not in done_z]
+                if new_zs:
+                    info(f"Zagęszczanie globalne Z wokół {focus.z:g} mm na X = {focus.x:g} mm ({len(new_zs)} nowych pkt)")
+                    for z in new_zs:
+                        measure(focus.x, z, "refine_z")
+                        done_points += 1
+                        if on_progress:
+                            on_progress("refine_z", done_points, total_points_est)
+                focus = best()
+
+            if focus:
+                info(f"Ognisko końcowe: X = {focus.x:g} mm, Z = {focus.z:g} mm, Temp = {focus.mean:.2f} C")
 
     except (ScanStopped, sc.MoveAborted):
         stopped = True

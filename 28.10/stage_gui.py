@@ -18,7 +18,7 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("System Sterowania Stolikami i Pirometrem")
-        root.geometry("1000x520")
+        root.geometry("1000x500")
 
         self.stages: sc.Stages | None = None
         self.pyro_server = PyroServer(address="192.168.2.112", port=9125)
@@ -208,6 +208,13 @@ class App:
         self.scan_drop_low = tk.StringVar(value="3")
         self.scan_drop_high = tk.StringVar(value="3")
 
+        # Lokalne dogęszczanie Z na każdym X
+        self.scan_refine_local_z_active = tk.BooleanVar(value=True)
+        self.scan_refine_local_z_span = tk.StringVar(value="0.3")
+        self.scan_refine_local_z_step = tk.StringVar(value="0.02")
+
+        # Globalne dogęszczanie
+        self.scan_refine_active = tk.BooleanVar(value=True)
         self.scan_refine_x_span = tk.StringVar(value="5.0")
         self.scan_refine_x_step = tk.StringVar(value="1.0")
         self.scan_refine_z_span = tk.StringVar(value="0.2")
@@ -237,12 +244,22 @@ class App:
         ttk.Entry(p_frame, textvariable=self.scan_drop_high, width=8).grid(row=r, column=3)
 
         r += 1
-        ttk.Label(p_frame, text="Zagęszczanie X (Okno +/- mm / Krok mm):").grid(row=r, column=0, sticky="w", pady=3)
+        ttk.Checkbutton(p_frame, text="Lokalne dogęszczanie Z na każdym X (Okno +/- mm / Krok mm):",
+                        variable=self.scan_refine_local_z_active).grid(row=r, column=0, sticky="w", pady=3)
+        ttk.Entry(p_frame, textvariable=self.scan_refine_local_z_span, width=8).grid(row=r, column=1)
+        ttk.Entry(p_frame, textvariable=self.scan_refine_local_z_step, width=8).grid(row=r, column=2)
+
+        r += 1
+        ttk.Checkbutton(p_frame, text="Globalne zagęszczanie X/Z wokół ogniska:",
+                        variable=self.scan_refine_active).grid(row=r, column=0, sticky="w", pady=3)
+
+        r += 1
+        ttk.Label(p_frame, text=" - Globalne X (Okno +/- mm / Krok mm):").grid(row=r, column=0, sticky="w", pady=2)
         ttk.Entry(p_frame, textvariable=self.scan_refine_x_span, width=8).grid(row=r, column=1)
         ttk.Entry(p_frame, textvariable=self.scan_refine_x_step, width=8).grid(row=r, column=2)
 
         r += 1
-        ttk.Label(p_frame, text="Zagęszczanie Z (Okno +/- mm / Krok mm):").grid(row=r, column=0, sticky="w", pady=3)
+        ttk.Label(p_frame, text=" - Globalne Z (Okno +/- mm / Krok mm):").grid(row=r, column=0, sticky="w", pady=2)
         ttk.Entry(p_frame, textvariable=self.scan_refine_z_span, width=8).grid(row=r, column=1)
         ttk.Entry(p_frame, textvariable=self.scan_refine_z_step, width=8).grid(row=r, column=2)
 
@@ -282,7 +299,7 @@ class App:
         self.status_var.set(msg)
         self.status_label.config(foreground="#b00020" if error else "black")
 
-    # ---------------------------------------------------------- Połączenia
+    # --------------------Połączenia--------------------
     def start_connect(self):
         self.connect_btn.config(state="disabled")
         self.set_status("Łączenie z kontrolerami...")
@@ -399,7 +416,7 @@ class App:
         self.stop_scenario_event.set()
         self.set_status("Wysłano sygnał przerwania scenariusza.")
 
-    # ------------------------------------------------ Scenariusze Pomiarowe
+    # ----------------Scenariusze Pomiarowe---------------------------
     def start_stationary(self):
         try:
             freq = float(self.stat_freq_var.get())
@@ -440,6 +457,10 @@ class App:
                 n_samples=int(self.scan_samples.get()),
                 drop_low=int(self.scan_drop_low.get()),
                 drop_high=int(self.scan_drop_high.get()),
+                refine_local_z=self.scan_refine_local_z_active.get(),
+                refine_local_z_halfwidth=float(self.scan_refine_local_z_span.get()),
+                refine_local_z_step=float(self.scan_refine_local_z_step.get()),
+                refine=self.scan_refine_active.get(),
                 refine_x_halfwidth=float(self.scan_refine_x_span.get()),
                 refine_x_step=float(self.scan_refine_x_step.get()),
                 refine_z_halfwidth=float(self.scan_refine_z_span.get()),
@@ -505,17 +526,18 @@ class App:
                 self.set_status(msg)
         elif kind == "scan_progress":
             _, phase, done, total = ev
-            pct = (done / total * 100) if total > 0 else 0
+            pct = (done / total * 100) if total > 0 and done <= total else (100.0 if done >= total else 0.0)
             self.scan_progressbar["value"] = pct
             
             faza_name = {
                 "coarse": "Skan zgrubny",
-                "refine_x": "Zagęszczanie osi X",
-                "refine_z": "Zagęszczanie osi Z"
+                "refine_local_z": "Lokalne dogęszczanie Z (na X)",
+                "refine_x": "Globalne zagęszczanie osi X",
+                "refine_z": "Globalne zagęszczanie osi Z"
             }.get(phase, phase)
             
             self.scan_prog_label.config(
-                text=f"Faza: {faza_name} | Wykonano {done} z {total} punktów ({pct:.1f}%)"
+                text=f"Faza: {faza_name} | Wykonano {done} z szacowanych {total} punktów ({pct:.1f}%)"
             )
         elif kind == "scan_done":
             _, msg, is_success = ev
@@ -570,10 +592,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  # s = PyroServer()
-  # s.connect()
-  # # raw1 = s.send_command("getSignalLevel")
-  # # raw1 = s.send_command("getSignalLevel")
-  # x = s.getSignalLevel()
-  # # print(raw1)
-  # s.disconnect()
