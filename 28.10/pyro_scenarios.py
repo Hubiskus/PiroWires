@@ -16,6 +16,8 @@ import stage_control as sc
 from pyrometer_classes import ConnectionError as PyroConnectionError, PyroServer
 
 TEMPERATURE_FIELD_INDEX = 3
+ROUND_SIGNAL = 15        # Precyzja zaokrąglenia prądu detektorów (A)
+ROUND_SIGNAL_LEVEL = 6  # Precyzja zaokrąglenia poziomu sygnału detektorów (%)
 
 
 class ScanStopped(Exception):
@@ -68,8 +70,44 @@ class PyroReader:
     def read(self) -> float:
         return parse_temperature(self.read_raw(), self.field_index)
 
+    def read_signal(self) -> tuple[float, float]:
+        tries = 0
+        while True:
+            try:
+                if not self.server.isConnected:
+                    self.server.connect()
+                return self.server.getSignal()
+            except (TimeoutError, PyroConnectionError, OSError, ValueError):
+                tries += 1
+                if tries > self.max_retries:
+                    raise
+                time.sleep(self.retry_delay)
+                self.server.disconnect()
+                time.sleep(self.retry_delay)
+
+    def read_signal_level(self) -> tuple[float, float]:
+        tries = 0
+        while True:
+            try:
+                if not self.server.isConnected:
+                    self.server.connect()
+                return self.server.getSignalLevel()
+            except (TimeoutError, PyroConnectionError, OSError, ValueError):
+                tries += 1
+                if tries > self.max_retries:
+                    raise
+                time.sleep(self.retry_delay)
+                self.server.disconnect()
+                time.sleep(self.retry_delay)
+
+    def read_full(self) -> tuple[float, tuple[float, float], tuple[float, float]]:
+        """Zwraca (temperatura, (sig1, sig2), (lvl1, lvl2))."""
+        temp = self.read()
+        sig = self.read_signal()
+        lvl = self.read_signal_level()
+        return temp, sig, lvl
+
     def get_mode(self) -> str:
-        """Odczytuje tryb pracy z serwera i zapamiętuje go."""
         try:
             mode = self.server.getPyroType()
             self.current_mode = mode
@@ -78,7 +116,6 @@ class PyroReader:
             return self.current_mode
 
     def set_mode(self, mode: str) -> str:
-        """Wysyła komendę zmiany trybu na serwer i odświeża stan."""
         try:
             self.server.setPyroType(mode)
             return self.get_mode()
@@ -137,7 +174,7 @@ def run_stationary(reader: PyroReader, p: StationaryParams, stop_event: threadin
         writer = csv.writer(stream, delimiter=";")
         writer.writerow(["Pomiar stacjonarny pirometru", f"Tryb: {mode}"])
         writer.writerow(["Czestotliwosc [Hz]:", p.frequency_hz, "Czas trwania [s]:", p.duration_s])
-        writer.writerow(["Czas (s)", "Temperatura (C)"])
+        writer.writerow(["Czas (s)", "Temperatura (C)", "Sygnal Det 1 (A)", "Sygnal Det 2 (A)", "Poziom Det 1 (%)", "Poziom Det 2 (%)"])
         t0 = time.perf_counter()
         next_t = t0
         while True:
@@ -150,12 +187,20 @@ def run_stationary(reader: PyroReader, p: StationaryParams, stop_event: threadin
             if wait > 0 and stop_event.wait(wait):
                 stopped = True
                 break
-            value = reader.read()
+            
+            temp, (sig1, sig2), (lvl1, lvl2) = reader.read_full()
             ts = time.perf_counter() - t0
-            writer.writerow([round(ts, 4), round(value, 4)])
+            writer.writerow([
+                round(ts, 4),
+                round(temp, 4),
+                round(sig1, ROUND_SIGNAL),
+                round(sig2, ROUND_SIGNAL),
+                round(lvl1, ROUND_SIGNAL_LEVEL),
+                round(lvl2, ROUND_SIGNAL_LEVEL)
+            ])
             n += 1
             if on_sample:
-                on_sample(ts, value)
+                on_sample(ts, temp)
             if on_progress:
                 on_progress(ts, p.duration_s, n)
             next_t += period
@@ -200,6 +245,10 @@ class ScanPoint:
     std: float
     n_kept: int
     n_samples: int
+    mean_sig1: float = 0.0
+    mean_sig2: float = 0.0
+    mean_lvl1: float = 0.0
+    mean_lvl2: float = 0.0
 
 
 @dataclass
@@ -242,20 +291,51 @@ def run_stepwise_scan(stages: sc.Stages, reader: PyroReader, p: ScanParams, stop
         if p.settle_s > 0 and stop_event.wait(p.settle_s):
             raise ScanStopped()
             
-        values = []
+        temps, sigs1, sigs2, lvls1, lvls2 = [], [], [], [], []
         for i in range(p.n_samples):
             check_stop()
-            values.append(reader.read())
+            t_val, (s1, s2), (l1, l2) = reader.read_full()
+            temps.append(t_val)
+            sigs1.append(s1)
+            sigs2.append(s2)
+            lvls1.append(l1)
+            lvls2.append(l2)
             if p.sample_delay_s > 0 and i < p.n_samples - 1 and stop_event.wait(p.sample_delay_s):
                 raise ScanStopped()
                 
-        mean, std, kept = trimmed_stats(values, p.drop_low, p.drop_high)
-        pt = ScanPoint(phase, time.monotonic() - t0, key[0], key[1], mean, std, len(kept), len(values))
+        mean_temp, std_temp, kept = trimmed_stats(temps, p.drop_low, p.drop_high)
+        mean_sig1 = sum(sigs1[i] for i in kept) / len(kept)
+        mean_sig2 = sum(sigs2[i] for i in kept) / len(kept)
+        mean_lvl1 = sum(lvls1[i] for i in kept) / len(kept)
+        mean_lvl2 = sum(lvls2[i] for i in kept) / len(kept)
+
+        pt = ScanPoint(
+            phase=phase,
+            timestamp=time.monotonic() - t0,
+            x=key[0],
+            z=key[1],
+            mean=mean_temp,
+            std=std_temp,
+            n_kept=len(kept),
+            n_samples=len(temps),
+            mean_sig1=mean_sig1,
+            mean_sig2=mean_sig2,
+            mean_lvl1=mean_lvl1,
+            mean_lvl2=mean_lvl2
+        )
         points[key] = pt
         
         if raw_writer is not None:
-            for i, v in enumerate(values):
-                raw_writer.writerow([round(pt.timestamp, 3), key[0], key[1], i + 1, round(v, 4), 1 if i in kept else 0])
+            for i in range(len(temps)):
+                raw_writer.writerow([
+                    round(pt.timestamp, 3), key[0], key[1], i + 1,
+                    round(temps[i], 4),
+                    round(sigs1[i], ROUND_SIGNAL),
+                    round(sigs2[i], ROUND_SIGNAL),
+                    round(lvls1[i], ROUND_SIGNAL_LEVEL),
+                    round(lvls2[i], ROUND_SIGNAL_LEVEL),
+                    1 if i in kept else 0
+                ])
             raw_stream.flush()
         if on_point:
             on_point(pt)
@@ -274,7 +354,7 @@ def run_stepwise_scan(stages: sc.Stages, reader: PyroReader, p: ScanParams, stop
             raw_stream = raw_path.open("w", newline="", encoding="utf-8")
             raw_writer = csv.writer(raw_stream, delimiter=";")
             raw_writer.writerow(["Skan krokowy pirometru - surowe probki", f"Tryb: {mode}"])
-            raw_writer.writerow(["Czas (s)", "Pozycja X (mm)", "Pozycja Z (mm)", "Probka nr", "Temperatura (C)", "Uwzgledniona w sredniej (1/0)"])
+            raw_writer.writerow(["Czas (s)", "Pozycja X (mm)", "Pozycja Z (mm)", "Probka nr", "Temperatura (C)", "Sygnal Det 1 (A)", "Sygnal Det 2 (A)", "Poziom Det 1 (%)", "Poziom Det 2 (%)", "Uwzgledniona w sredniej (1/0)"])
 
         xs = frange(p.x_start, p.x_stop, p.x_step)
         zs = frange(p.z_start, p.z_stop, p.z_step)
@@ -319,10 +399,28 @@ def run_stepwise_scan(stages: sc.Stages, reader: PyroReader, p: ScanParams, stop
                 w = csv.writer(stream, delimiter=";")
                 w.writerow(["Podsumowanie skanu krokowego / ogniska", f"Tryb: {mode}"])
                 if focus_final:
-                    w.writerow(["Wyznaczone ognisko X [mm]:", focus_final.x, "Z [mm]:", focus_final.z, "Max Temp [C]:", round(focus_final.mean, 4)])
-                w.writerow(["Faza", "X (mm)", "Z (mm)", "Srednia temp (C)", "Odchylenie std", "Uzytych probek", "Liczba probek", "Czas (s)"])
+                    w.writerow([
+                        "Wyznaczone ognisko X [mm]:", focus_final.x,
+                        "Z [mm]:", focus_final.z,
+                        "Max Temp [C]:", round(focus_final.mean, 4),
+                        "Sygnal Det 1 [A]:", round(focus_final.mean_sig1, ROUND_SIGNAL),
+                        "Sygnal Det 2 [A]:", round(focus_final.mean_sig2, ROUND_SIGNAL),
+                        "Poziom Det 1 [%]:", round(focus_final.mean_lvl1, ROUND_SIGNAL_LEVEL),
+                        "Poziom Det 2 [%]:", round(focus_final.mean_lvl2, ROUND_SIGNAL_LEVEL)
+                    ])
+                w.writerow(["Faza", "X (mm)", "Z (mm)", "Srednia temp (C)", "Odchylenie std", "Sygnal Det 1 (A)", "Sygnal Det 2 (A)", "Poziom Det 1 (%)", "Poziom Det 2 (%)", "Uzytych probek", "Liczba probek", "Czas (s)"])
                 for q in sorted_points:
-                    w.writerow([q.phase, q.x, q.z, round(q.mean, 4), round(q.std, 4), q.n_kept, q.n_samples, round(q.timestamp, 3)])
+                    w.writerow([
+                        q.phase, q.x, q.z,
+                        round(q.mean, 4),
+                        round(q.std, 4),
+                        round(q.mean_sig1, ROUND_SIGNAL),
+                        round(q.mean_sig2, ROUND_SIGNAL),
+                        round(q.mean_lvl1, ROUND_SIGNAL_LEVEL),
+                        round(q.mean_lvl2, ROUND_SIGNAL_LEVEL),
+                        q.n_kept, q.n_samples,
+                        round(q.timestamp, 3)
+                    ])
 
     result = ScanResult(list(points.values()), best(), summary_path if points else None, raw_path if points else None, stopped)
     if failure is not None:

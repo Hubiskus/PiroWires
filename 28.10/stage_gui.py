@@ -130,13 +130,11 @@ class App:
         btn_stop.grid(row=r, column=10, padx=3)
 
         row["action_buttons"] = [btn_abs, btn_minus, btn_plus, btn_zero_pos, btn_home]
-        row["stop_button"].config(state="normal" if connected else "disabled") if "stop_button" in row else None
         row["stop_button"] = btn_stop
         self.rows[axis] = row
         self._update_buttons(axis)
 
     def _build_pyro_tab(self, parent):
-        # 1. Połączenie TCP
         cfg_frame = ttk.LabelFrame(parent, text=" Połączenie z Pirometrem ", padding=10)
         cfg_frame.pack(fill="x", pady=(0, 8))
 
@@ -152,7 +150,6 @@ class App:
         self.pyro_status_var = tk.StringVar(value="Niepołączony")
         ttk.Label(cfg_frame, textvariable=self.pyro_status_var, font=("TkDefaultFont", 9, "bold")).grid(row=0, column=5, padx=5)
 
-        # 2. Tryb Pracy Pirometru
         mode_frame = ttk.LabelFrame(parent, text=" Tryb Pracy Pirometru ", padding=10)
         mode_frame.pack(fill="x", pady=(0, 8))
 
@@ -160,15 +157,13 @@ class App:
         ttk.Label(mode_frame, textvariable=self.pyro_mode_var, font=("Consolas", 11, "bold")).grid(row=0, column=0, padx=10, sticky="w")
         ttk.Button(mode_frame, text="Odczytaj Tryb", command=self.read_pyro_mode).grid(row=0, column=1, padx=5)
 
-        # 3. Szybki Odczyt Temperatury
-        read_frame = ttk.LabelFrame(parent, text=" Szybki Odczyt Temperatury ", padding=10)
+        read_frame = ttk.LabelFrame(parent, text=" Szybki Odczyt Temperatury i Sygnału ", padding=10)
         read_frame.pack(fill="x", pady=(0, 8))
 
         self.pyro_temp_var = tk.StringVar(value="-- °C")
         ttk.Label(read_frame, textvariable=self.pyro_temp_var, font=("Consolas", 16, "bold")).pack(side="left", padx=10)
-        ttk.Button(read_frame, text="Odczytaj Temp", command=self.read_pyro_temp).pack(side="left", padx=10)
+        ttk.Button(read_frame, text="Odczytaj Stan Na Żywo", command=self.read_pyro_temp).pack(side="left", padx=10)
 
-        # 4. Pomiar Stacjonarny
         stat_frame = ttk.LabelFrame(parent, text=" Scenariusz 1: Pomiar Stacjonarny ", padding=10)
         stat_frame.pack(fill="both", expand=True)
 
@@ -324,31 +319,18 @@ class App:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def set_pyro_mode(self):
-        selected = self.mode_select_var.get().strip()
-
-        def worker():
-            try:
-                mode = self.pyro_reader.set_mode(selected)
-                self.pyro_mode_var.set(f"Tryb: {mode}")
-                self.set_status(f"Ustawiono tryb pirometru: {mode}")
-            except Exception as e:
-                self.set_status(f"Błąd ustawiania trybu: {e}", error=True)
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def read_pyro_temp(self):
         def worker():
             try:
-                temp = self.pyro_reader.read()
+                temp, (sig1, sig2), (lvl1, lvl2) = self.pyro_reader.read_full()
                 self.pyro_temp_var.set(f"{temp:.2f} °C")
+                self.set_status(f"Temp: {temp:.2f} °C | Sig: {sig1:.3e} / {sig2:.3e} A | Lvl: {lvl1:.1f}% / {lvl2:.1f}%")
             except Exception as e:
                 self.pyro_temp_var.set("Błąd")
                 self.set_status(f"Błąd odczytu: {e}", error=True)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    # ------------------------------------------------------------ Komendy
     @staticmethod
     def _parse(var, what):
         try:
@@ -588,3 +570,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+  # s = PyroServer()
+  # s.connect()
+  # # raw1 = s.send_command("getSignalLevel")
+  # # raw1 = s.send_command("getSignalLevel")
+  # x = s.getSignalLevel()
+  # # print(raw1)
+  # s.disconnect()
